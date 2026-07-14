@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aditya-ig10/LWP/internal/browser"
@@ -28,7 +29,7 @@ var models = []string{
 }
 
 var knownSites = map[string]string{
-	"gmail":  "https://mail.google.com",
+	"gmail": "https://mail.google.com",
 }
 
 var siteSearchURLs = map[string]string{
@@ -49,6 +50,80 @@ var siteSearchURLs = map[string]string{
 	"twitter":   "https://twitter.com/search?q=%s",
 	"x.com":     "https://x.com/search?q=%s",
 }
+
+// --- Spinner ---
+
+type spinner struct {
+	mu     sync.Mutex
+	frames []string
+	i      int
+	msg    string
+	done   chan struct{}
+}
+
+var spinFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+func newSpinner(msg string) *spinner {
+	return &spinner{
+		frames: spinFrames,
+		msg:    msg + " ",
+		done:   make(chan struct{}),
+	}
+}
+
+func (s *spinner) start() {
+	if !isTerminal() {
+		fmt.Print(s.msg)
+		return
+	}
+	go func() {
+		for {
+			select {
+			case <-s.done:
+				return
+			default:
+				s.mu.Lock()
+				frame := s.frames[s.i%len(s.frames)]
+				s.i++
+				s.mu.Unlock()
+				fmt.Printf("\r  \033[36m%s\033[0m %s", frame, s.msg)
+				time.Sleep(80 * time.Millisecond)
+			}
+		}
+	}()
+}
+
+func (s *spinner) stop(doneMsg string) {
+	if isTerminal() {
+		close(s.done)
+		fmt.Printf("\r  \033[32m●\033[0m %s\033[K\n", s.msg+doneMsg)
+	} else {
+		fmt.Println(doneMsg)
+	}
+}
+
+func (s *spinner) fail(errMsg string) {
+	if isTerminal() {
+		close(s.done)
+		fmt.Printf("\r  \033[31m●\033[0m %s\033[K\n", s.msg+errMsg)
+	} else {
+		fmt.Println("FAIL:", errMsg)
+	}
+}
+
+func step(label string) {
+	fmt.Printf("  \033[2m│\033[0m %s\n", label)
+}
+
+func stepDone(label, detail string) {
+	fmt.Printf("  \033[2m├─ \033[32m%s\033[0m \033[2m%s\033[0m\n", label, detail)
+}
+
+func stepFail(label, detail string) {
+	fmt.Printf("  \033[2m├─ \033[31m%s\033[0m \033[2m%s\033[0m\n", label, detail)
+}
+
+// --- Session ---
 
 type session struct {
 	scanner            *bufio.Scanner
@@ -77,11 +152,11 @@ func Start() {
 
 	s.apiKey = os.Getenv("GEMINI_API_KEY")
 	if s.apiKey == "" && isTerminal() {
-		fmt.Print("\n  GEMINI_API_KEY not set. Enter your API key: ")
+		fmt.Print("\n  \033[2mGEMINI_API_KEY not set. Enter your API key:\033[0m ")
 		key, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		s.apiKey = strings.TrimSpace(key)
 		if s.apiKey == "" {
-			fmt.Println("  No key set. Use 'key <your-key>' inside the REPL.")
+			fmt.Println("  \033[33mNo key set. Use 'key <your-key>' inside the REPL.\033[0m")
 		}
 		os.Setenv("GEMINI_API_KEY", s.apiKey)
 	}
@@ -97,7 +172,7 @@ func Start() {
 
 func (s *session) prompt() bool {
 	if isTerminal() {
-		fmt.Print("\033[36mlwp> \033[0m")
+		fmt.Print("\033[36m◆ \033[0m")
 	}
 	if !s.scanner.Scan() {
 		return false
@@ -110,7 +185,7 @@ func (s *session) prompt() bool {
 	switch {
 	case input == "exit" || input == "quit":
 		s.closeBrowser()
-		fmt.Println("bye")
+		fmt.Println()
 		return false
 	case input == "help":
 		s.printHelp()
@@ -122,18 +197,18 @@ func (s *session) prompt() bool {
 			s.selectModel()
 		} else {
 			s.model = m
-			fmt.Printf("  \033[2m→ model set to:\033[0m %s\n", s.model)
+			fmt.Printf("  \033[2mmodel set to:\033[0m %s\n", s.model)
 		}
 	case strings.HasPrefix(input, "key "):
 		s.apiKey = strings.TrimPrefix(input, "key ")
 		os.Setenv("GEMINI_API_KEY", s.apiKey)
-		fmt.Println("  \033[2m→ API key updated\033[0m")
+		fmt.Println("  \033[2mAPI key updated\033[0m")
 	case input == "browser" || input == "live":
 		s.startBrowser()
 	case input == "fetch" || input == "tier1":
 		s.closeBrowser()
 		s.browserMode = false
-		fmt.Println("  \033[2m→ switched to Tier 1 (HTTP fetch) mode\033[0m")
+		fmt.Println("  \033[2mswitched to Tier 1 (HTTP fetch) mode\033[0m")
 	case strings.HasPrefix(input, "click "):
 		s.doClick(input)
 	case strings.HasPrefix(input, "type "):
@@ -176,57 +251,54 @@ func (s *session) prompt() bool {
 
 func printBanner() {
 	fmt.Println()
-	fmt.Println("  \033[1m╔══════════════════════════════════════╗\033[0m")
-	fmt.Println("  \033[1m║  LWP — LLM Web Protocol              ║\033[0m")
-	fmt.Println("  \033[1m║  Interactive mode                     ║\033[0m")
-	fmt.Println("  \033[1m╚══════════════════════════════════════╝\033[0m")
+	fmt.Println("  \033[1mLWP\033[0m \033[2m— LLM Web Protocol\033[0m")
 	fmt.Println()
 }
 
 func (s *session) printHelp() {
 	fmt.Println()
 	fmt.Println("  \033[1mCommands:\033[0m")
-	fmt.Println("    \033[1m<url>\033[0m            fetch a page")
-	fmt.Println("    \033[1m<question>\033[0m        ask Gemini")
-	fmt.Println("    \033[1mmodel\033[0m              select model")
-	fmt.Println("    \033[1mkey <key>\033[0m          set API key")
-	fmt.Println("    \033[1mhelp\033[0m               this help")
-	fmt.Println("    \033[1mexit\033[0m               quit")
+	fmt.Println("    \033[36m<url>\033[0m            fetch a page")
+	fmt.Println("    \033[36m<question>\033[0m        ask Gemini")
+	fmt.Println("    \033[36mmodel\033[0m              select model")
+	fmt.Println("    \033[36mkey <key>\033[0m          set API key")
+	fmt.Println("    \033[36mhelp\033[0m               this help")
+	fmt.Println("    \033[36mexit\033[0m               quit")
 	fmt.Println()
 	fmt.Println("  \033[1mSearch:\033[0m")
-	fmt.Println("    \"search for <query> on <site>\"")
-	fmt.Println("    \"search for <url>\"")
+	fmt.Println("    \033[2m\"search for <query> on <site>\"\033[0m")
 	fmt.Println()
-	fmt.Println("  \033[1mBrowser mode (type \033[36mbrowser\033[0m \033[1mto start):\033[0m")
-	fmt.Println("    \033[1mclick <ref>\033[0m          click element by ref number")
-	fmt.Println("    \033[1mtype <ref> \"<text>\"\033[0m   type text into element")
-	fmt.Println("    \033[1msubmit [ref]\033[0m         submit form")
-	fmt.Println("    \033[1mss\033[0m                   take screenshot")
-	fmt.Println("    \033[1mrefresh\033[0m              reload page")
-	fmt.Println("    \033[1melements\033[0m             list all interactive elements")
-	fmt.Println("    \033[1mfetch\033[0m                switch back to Tier 1 mode")
+	fmt.Println("  \033[1mBrowser mode (\033[36mtype browser\033[0m \033[1mto start):\033[0m")
+	fmt.Println("    \033[36mclick <ref>\033[0m          click element")
+	fmt.Println("    \033[36mtype <ref> \"text\"\033[0m    type into element")
+	fmt.Println("    \033[36msubmit\033[0m                submit form")
+	fmt.Println("    \033[36mss\033[0m                    screenshot")
+	fmt.Println("    \033[36mrefresh\033[0m               reload page")
+	fmt.Println("    \033[36melements\033[0m              list elements")
+	fmt.Println("    \033[36mfetch\033[0m                 switch to Tier 1")
 	fmt.Println()
 }
 
 func (s *session) selectModel() {
-	fmt.Println("\n  \033[1mSelect a model:\033[0m")
+	fmt.Println()
+	mark := " \033[36m●\033[0m"
+	plain := "   "
 	for i, m := range models {
-		mark := " "
+		p := plain
 		if m == s.model {
-			mark = "●"
+			p = mark
 		}
-		fmt.Printf("  \033[36m%s\033[0m [\033[1m%d\033[0m] %s\n", mark, i+1, m)
+		fmt.Printf("  %s [\033[1m%d\033[0m] %s\n", p, i+1, m)
 	}
-	fmt.Printf("  \033[2m  [0] custom\033[0m\n")
-	fmt.Print("  \033[2mnumber (or 0 for custom):\033[0m ")
+	fmt.Printf("  %s [\033[1m0\033[0m] custom\n", plain)
+	fmt.Print("  \033[2mselect:\033[0m ")
 
 	line := s.readLine()
 	if line == "" {
-		fmt.Printf("  \033[2m→ \033[0m%s\n", s.model)
 		return
 	}
 	if line == "0" || strings.EqualFold(line, "custom") {
-		fmt.Print("  \033[2mModel name:\033[0m ")
+		fmt.Print("  \033[2mname:\033[0m ")
 		name := s.readLine()
 		if name != "" {
 			s.model = name
@@ -237,7 +309,7 @@ func (s *session) selectModel() {
 			s.model = models[idx-1]
 		}
 	}
-	fmt.Printf("  \033[2m→ active model:\033[0m %s\n", s.model)
+	fmt.Printf("  \033[2m→ %s\033[0m\n", s.model)
 }
 
 func (s *session) readLine() string {
@@ -338,7 +410,7 @@ func (s *session) resetIdleTimer() {
 		s.browserIdle.Stop()
 	}
 	s.browserIdle = time.AfterFunc(s.browserIdleTimeout, func() {
-		fmt.Println("\n  \033[33m⚠ Browser auto-closed (idle timeout)\033[0m")
+		fmt.Println("\n  \033[33m● Browser auto-closed (idle)\033[0m")
 		s.browser.Close()
 		s.browser = nil
 	})
@@ -346,22 +418,22 @@ func (s *session) resetIdleTimer() {
 
 func (s *session) startBrowser() {
 	if s.browser != nil {
-		fmt.Println("  \033[2m→ browser already running\033[0m")
 		s.browserMode = true
 		s.resetIdleTimer()
 		return
 	}
 
-	fmt.Print("  \033[2m→ launching headless Chrome ...\033[0m")
+	sp := newSpinner("launching headless Chrome")
+	sp.start()
 	b, err := browser.New(true)
 	if err != nil {
-		fmt.Printf(" \033[31m%s\033[0m\n", err)
+		sp.fail(err.Error())
 		return
 	}
 	s.browser = b
 	s.browserMode = true
 	s.resetIdleTimer()
-	fmt.Println(" \033[32mdone\033[0m")
+	sp.stop("ready")
 }
 
 func (s *session) closeBrowser() {
@@ -382,43 +454,42 @@ func (s *session) browseURL(rawURL string) {
 		rawURL = "https://" + rawURL
 	}
 
-	fmt.Printf("  \033[2m→ browsing %s ...\033[0m\n", rawURL)
+	fmt.Printf("  \033[2m│\033[0m \033[36m🌐\033[0m %s\n", rawURL)
 
+	sp := newSpinner("loading page")
+	sp.start()
 	page, err := s.browser.Navigate(rawURL, 30*time.Second)
 	if err != nil {
-		fmt.Printf("  \033[31mError: %s\033[0m\n", err)
+		sp.fail(err.Error())
 		return
 	}
+	sp.stop("")
 
 	s.pageURL = page.URL
 	s.pageText = page.Content
 	s.elems = page.Elements
 	s.browserMode = true
 
-	fmt.Printf("  \033[2m→ title:\033[0m %s\n", page.Title)
-	fmt.Printf("  \033[2m→ elements:\033[0m %d  \033[2mcontent:\033[0m %d chars\n",
-		len(page.Elements), len(page.Content))
-
-	s.printElementSummary()
+	stepDone("loaded", fmt.Sprintf("\033[36m%s\033[0m", page.Title))
+	step("")
 }
 
 func (s *session) browseSearch(site, query string) {
 	u := searchURL(site, query)
 	if u == "" {
-		fmt.Printf("  \033[31mUnknown site: %s\033[0m\n", site)
+		fmt.Printf("  \033[31m● unknown site: %s\033[0m\n", site)
 		return
 	}
-	fmt.Printf("  \033[2m→ searching %s for \"%s\" ...\033[0m\n", site, query)
+	step(fmt.Sprintf("\033[36msearch %s\033[0m \033[2mfor \"%s\"\033[0m", site, query))
 	s.browseURL(u)
 }
 
 func (s *session) printElements() {
 	if len(s.elems) == 0 {
-		fmt.Println("  \033[33mNo elements loaded. Browse a page first.\033[0m")
+		fmt.Println("  \033[33mno elements loaded\033[0m")
 		return
 	}
 
-	fmt.Println()
 	for _, e := range s.elems {
 		label := fmt.Sprintf("\033[36m[%d]\033[0m <%s>", e.Ref, e.Tag)
 		if e.Type != "" {
@@ -436,7 +507,6 @@ func (s *session) printElements() {
 		fmt.Println("  " + label)
 	}
 	fmt.Printf("  \033[2mtotal: %d elements\033[0m\n", len(s.elems))
-	fmt.Println()
 }
 
 func (s *session) printElementSummary() {
@@ -467,7 +537,7 @@ func (s *session) printElementSummary() {
 		parts = append(parts, fmt.Sprintf("%d buttons", buttons))
 	}
 	if len(parts) > 0 {
-		fmt.Printf("  \033[2m→ \033[0m%s\n", strings.Join(parts, ", "))
+		fmt.Printf("  \033[2m├─\033[0m %s\n", strings.Join(parts, ", "))
 	}
 }
 
@@ -476,31 +546,32 @@ func (s *session) printElementSummary() {
 func (s *session) doClick(input string) {
 	s.resetIdleTimer()
 	if s.browser == nil {
-		fmt.Println("  \033[33mBrowser not started. Type 'browser' first.\033[0m")
+		fmt.Println("  \033[33mbrowser not started\033[0m")
 		return
 	}
 
 	parts := strings.Fields(input)
 	if len(parts) < 2 {
-		fmt.Println("  \033[33mUsage: click <ref>\033[0m")
+		fmt.Println("  \033[33musage: click <ref>\033[0m")
 		return
 	}
 
 	ref, err := strconv.Atoi(parts[1])
 	if err != nil {
-		fmt.Println("  \033[33mInvalid ref number\033[0m")
+		fmt.Println("  \033[33minvalid ref\033[0m")
 		return
 	}
 
 	sel := s.selectorForRef(ref)
 	if sel == "" {
-		fmt.Printf("  \033[33mNo element with ref %d\033[0m\n", ref)
+		fmt.Printf("  \033[33mno element [%d]\033[0m\n", ref)
 		return
 	}
 
-	fmt.Printf("  \033[2m→ clicking [%d] ...\033[0m\n", ref)
+	sp := newSpinner(fmt.Sprintf("clicking [%d]", ref))
+	sp.start()
 	if err := s.browser.Click(sel); err != nil {
-		fmt.Printf("  \033[31mError: %s\033[0m\n", err)
+		sp.fail(err.Error())
 		return
 	}
 
@@ -511,49 +582,48 @@ func (s *session) doClick(input string) {
 		s.pageText = page.Content
 		s.pageURL = page.URL
 	}
-
-	fmt.Println("  \033[32mdone\033[0m")
+	sp.stop("done")
 }
 
 func (s *session) doType(input string) {
 	s.resetIdleTimer()
 	if s.browser == nil {
-		fmt.Println("  \033[33mBrowser not started. Type 'browser' first.\033[0m")
+		fmt.Println("  \033[33mbrowser not started\033[0m")
 		return
 	}
 
 	parts := strings.SplitN(input, " ", 3)
 	if len(parts) < 3 {
-		fmt.Println("  \033[33mUsage: type <ref> \"<text>\"\033[0m")
+		fmt.Println("  \033[33musage: type <ref> \"<text>\"\033[0m")
 		return
 	}
 
 	ref, err := strconv.Atoi(parts[1])
 	if err != nil {
-		fmt.Println("  \033[33mInvalid ref number\033[0m")
+		fmt.Println("  \033[33minvalid ref\033[0m")
 		return
 	}
 
 	text := strings.Trim(parts[2], "\"")
 	sel := s.selectorForRef(ref)
 	if sel == "" {
-		fmt.Printf("  \033[33mNo element with ref %d\033[0m\n", ref)
+		fmt.Printf("  \033[33mno element [%d]\033[0m\n", ref)
 		return
 	}
 
-	fmt.Printf("  \033[2m→ typing into [%d] ...\033[0m\n", ref)
+	sp := newSpinner(fmt.Sprintf("typing into [%d]", ref))
+	sp.start()
 	if err := s.browser.Type(sel, text); err != nil {
-		fmt.Printf("  \033[31mError: %s\033[0m\n", err)
+		sp.fail(err.Error())
 		return
 	}
-
-	fmt.Println("  \033[32mdone\033[0m")
+	sp.stop("done")
 }
 
 func (s *session) doSubmit(selector string) {
 	s.resetIdleTimer()
 	if s.browser == nil {
-		fmt.Println("  \033[33mBrowser not started. Type 'browser' first.\033[0m")
+		fmt.Println("  \033[33mbrowser not started\033[0m")
 		return
 	}
 
@@ -561,9 +631,10 @@ func (s *session) doSubmit(selector string) {
 		selector = "form"
 	}
 
-	fmt.Print("  \033[2m→ submitting ...\033[0m")
+	sp := newSpinner("submitting form")
+	sp.start()
 	if err := s.browser.Submit(selector); err != nil {
-		fmt.Printf(" \033[31m%s\033[0m\n", err)
+		sp.fail(err.Error())
 		return
 	}
 
@@ -573,52 +644,54 @@ func (s *session) doSubmit(selector string) {
 		s.elems = page.Elements
 		s.pageText = page.Content
 		s.pageURL = page.URL
-		fmt.Printf(" \033[32mdone\033[0m  \033[2m→ %s\033[0m\n", page.Title)
+		sp.stop(fmt.Sprintf("\033[36m%s\033[0m", page.Title))
 	} else {
-		fmt.Println(" \033[32mdone\033[0m")
+		sp.stop("done")
 	}
 }
 
 func (s *session) doScreenshot() {
 	s.resetIdleTimer()
 	if s.browser == nil {
-		fmt.Println("  \033[33mBrowser not started. Type 'browser' first.\033[0m")
+		fmt.Println("  \033[33mbrowser not started\033[0m")
 		return
 	}
 
+	sp := newSpinner("capturing screenshot")
+	sp.start()
 	buf, err := s.browser.ScreenshotFull()
 	if err != nil {
-		fmt.Printf("  \033[31mError: %s\033[0m\n", err)
+		sp.fail(err.Error())
 		return
 	}
 
 	fname := fmt.Sprintf("lwp_screenshot_%d.png", time.Now().Unix())
 	if err := os.WriteFile(fname, buf, 0644); err != nil {
-		fmt.Printf("  \033[31mError: %s\033[0m\n", err)
+		sp.fail(err.Error())
 		return
 	}
-
-	fmt.Printf("  \033[2m→ saved: %s (%d KB)\033[0m\n", fname, len(buf)/1024)
+	sp.stop(fmt.Sprintf("saved %s (%d KB)", fname, len(buf)/1024))
 }
 
 func (s *session) doRefresh() {
 	s.resetIdleTimer()
 	if s.browser == nil {
-		fmt.Println("  \033[33mBrowser not started. Type 'browser' first.\033[0m")
+		fmt.Println("  \033[33mbrowser not started\033[0m")
 		return
 	}
 
+	sp := newSpinner("refreshing")
+	sp.start()
 	page, err := s.browser.Refresh()
 	if err != nil {
-		fmt.Printf("  \033[31mError: %s\033[0m\n", err)
+		sp.fail(err.Error())
 		return
 	}
 
 	s.elems = page.Elements
 	s.pageText = page.Content
 	s.pageURL = page.URL
-
-	fmt.Printf("  \033[2m→ refreshed: %s\033[0m\n", page.Title)
+	sp.stop(fmt.Sprintf("\033[36m%s\033[0m", page.Title))
 }
 
 func (s *session) selectorForRef(ref int) string {
@@ -635,25 +708,30 @@ func (s *session) selectorForRef(ref int) string {
 func (s *session) searchSite(site, query string) {
 	u := searchURL(site, query)
 	if u == "" {
-		fmt.Printf("  \033[31mUnknown site: %s\033[0m\n", site)
+		fmt.Printf("  \033[31m● unknown site: %s\033[0m\n", site)
 		return
 	}
 
-	fmt.Printf("  \033[2m→ searching %s for \"%s\" ...\033[0m\n", site, query)
+	fmt.Printf("  \033[2m│\033[0m \033[36msearch %s\033[0m \033[2mfor \"%s\"\033[0m\n", site, query)
 
+	sp := newSpinner("fetching results")
+	sp.start()
 	page, err := extract.Tier1(u, 30*time.Second)
 	if err != nil {
-		fmt.Printf("  \033[31mError: %s\033[0m\n", err)
+		sp.fail(err.Error())
 		return
 	}
+	sp.stop(fmt.Sprintf("%d KB — \033[36m%s\033[0m", page.Metadata.ContentLength/1024, page.Title))
+
+	l := len(page.Elements)
+	c := page.Metadata.ContentLength
+	t := page.Metadata.LatencyMs
+	fmt.Printf("  \033[2m├─\033[0m %d elements  %d chars  %d ms\n", l, c, t)
 
 	s.pageURL = page.URL
 	s.pageText = fmt.Sprintf("Page: %s\nTitle: %s\n\n%s", page.URL, page.Title, page.Content)
 
-	fmt.Printf("  \033[2m→ title:\033[0m %s\n", page.Title)
-	fmt.Printf("  \033[2m→ elements:\033[0m %d  \033[2mcontent:\033[0m %d chars  \033[2mlatency:\033[0m %dms\n",
-		len(page.Elements), page.Metadata.ContentLength, page.Metadata.LatencyMs)
-
+	fmt.Printf("  \033[2m│\033[0m \033[36m\033[0m analyzing...\n")
 	s.askGemini(fmt.Sprintf("What are the best results for \"%s\" on this page? Summarize the top products.", query))
 }
 
@@ -662,29 +740,33 @@ func (s *session) fetchPage(rawURL string) {
 		rawURL = "https://" + rawURL
 	}
 	if _, err := url.Parse(rawURL); err != nil {
-		fmt.Printf("  \033[31mInvalid URL: %s\033[0m\n", err)
+		fmt.Printf("  \033[31m● invalid URL: %s\033[0m\n", err)
 		return
 	}
 
-	fmt.Printf("  \033[2m→ fetching %s ...\033[0m\n", rawURL)
+	fmt.Printf("  \033[2m│\033[0m \033[36m🌐\033[0m %s\n", rawURL)
 
+	sp := newSpinner("fetching page")
+	sp.start()
 	page, err := extract.Tier1(rawURL, 30*time.Second)
 	if err != nil {
-		fmt.Printf("  \033[31mError: %s\033[0m\n", err)
+		sp.fail(err.Error())
 		return
 	}
+	sp.stop(fmt.Sprintf("%d KB — \033[36m%s\033[0m", page.Metadata.ContentLength/1024, page.Title))
+
+	l := len(page.Elements)
+	c := page.Metadata.ContentLength
+	t := page.Metadata.LatencyMs
+	fmt.Printf("  \033[2m├─\033[0m %d elements  %d chars  %d ms\n", l, c, t)
 
 	s.pageURL = page.URL
 	s.pageText = fmt.Sprintf("Page: %s\nTitle: %s\n\n%s", page.URL, page.Title, page.Content)
-
-	fmt.Printf("  \033[2m→ title:\033[0m %s\n", page.Title)
-	fmt.Printf("  \033[2m→ elements:\033[0m %d  \033[2mcontent:\033[0m %d chars  \033[2mlatency:\033[0m %dms\n",
-		len(page.Elements), page.Metadata.ContentLength, page.Metadata.LatencyMs)
 }
 
 func (s *session) askGemini(question string) {
 	if s.apiKey == "" {
-		fmt.Println("  \033[31mNo API key set. Use 'key <your-key>' first.\033[0m")
+		fmt.Println("  \033[31m● no API key. Use 'key <your-key>' first.\033[0m")
 		return
 	}
 
@@ -719,12 +801,14 @@ The user asks: %s`, s.pageText, question)
 		prompt = question
 	}
 
-	fmt.Printf("  \033[2m→ asking %s ...\033[0m\n", s.model)
+	sp := newSpinner(fmt.Sprintf("asking %s", s.model))
+	sp.start()
 	answer, err := llm.Chat(prompt, 120*time.Second)
 	if err != nil {
-		fmt.Printf("  \033[31mError: %s\033[0m\n", err)
+		sp.fail(err.Error())
 		return
 	}
+	sp.stop("")
 
 	fmt.Println()
 	fmt.Println(answer)

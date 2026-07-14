@@ -2,6 +2,7 @@ package browser
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -164,7 +165,7 @@ func (b *Browser) extractPage(ctx context.Context) (*Page, error) {
 	page.Title = title
 	page.URL = url
 
-	if err := jsonUnmarshal([]byte(elementsJSON), &page.Elements); err != nil {
+	if err := json.Unmarshal([]byte(elementsJSON), &page.Elements); err != nil {
 		return nil, fmt.Errorf("parse elements: %w", err)
 	}
 
