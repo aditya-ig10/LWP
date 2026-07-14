@@ -168,7 +168,17 @@ func (s *session) readLine() string {
 
 func looksLikeURL(s string) bool {
 	s = strings.TrimSpace(s)
-	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") || strings.Contains(s, ".")
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		return true
+	}
+	if !strings.Contains(s, ".") || strings.HasPrefix(s, ".") || strings.HasSuffix(s, ".") {
+		return false
+	}
+	words := strings.Fields(s)
+	if len(words) != 1 {
+		return false
+	}
+	return strings.Contains(s, ".") && !strings.Contains(s, " ")
 }
 
 func (s *session) fetchPage(rawURL string) {
@@ -201,16 +211,17 @@ func (s *session) askGemini(question string) {
 		fmt.Println("  \033[31mNo API key set. Use 'key <your-key>' first.\033[0m")
 		return
 	}
-	if s.pageText == "" {
-		fmt.Println("  \033[33mNo page in context. Enter a URL first.\033[0m")
-		return
-	}
 
-	prompt := fmt.Sprintf(`I fetched this page:
+	var prompt string
+	if s.pageText != "" {
+		prompt = fmt.Sprintf(`I fetched this page:
 
 %s
 
 The user asks: %s`, s.pageText, question)
+	} else {
+		prompt = question
+	}
 
 	fmt.Printf("  \033[2m→ asking %s ...\033[0m\n", s.model)
 	answer, err := llm.Chat(prompt, 120*time.Second)
