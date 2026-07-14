@@ -8,11 +8,13 @@ import (
 
 	"github.com/aditya-ig10/LWP/internal/extract"
 	"github.com/aditya-ig10/LWP/internal/llm"
+	"github.com/aditya-ig10/LWP/internal/repl"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		usage()
+		repl.Start()
+		return
 	}
 
 	switch os.Args[1] {
@@ -26,18 +28,18 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: lwp <command> [args]")
+	fmt.Fprintln(os.Stderr, "usage: lwp [command] [args]")
 	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "commands:")
-	fmt.Fprintln(os.Stderr, "  fetch <url>            extract page content (Tier 1)")
-	fmt.Fprintln(os.Stderr, "    --pretty             pretty-print JSON output")
-	fmt.Fprintln(os.Stderr, "    --timeout <sec>      request timeout (default 30)")
+	fmt.Fprintln(os.Stderr, "  (no args)    interactive REPL mode")
+	fmt.Fprintln(os.Stderr, "  fetch <url>  extract page content (Tier 1)")
+	fmt.Fprintln(os.Stderr, "    --pretty            pretty-print JSON output")
+	fmt.Fprintln(os.Stderr, "    --timeout <sec>     request timeout (default 30)")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "  chat <url> \"<question>\"  fetch + ask Gemini about page")
-	fmt.Fprintln(os.Stderr, "    --timeout <sec>      request timeout (default 60)")
+	fmt.Fprintln(os.Stderr, "    --timeout <sec>     request timeout (default 60)")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "env:")
-	fmt.Fprintln(os.Stderr, "  GEMINI_API_KEY         required for chat command")
+	fmt.Fprintln(os.Stderr, "  GEMINI_API_KEY         required for chat and REPL mode")
 	fmt.Fprintln(os.Stderr, "  GEMINI_MODEL           model name (default gemini-flash-lite-latest)")
 	os.Exit(2)
 }
