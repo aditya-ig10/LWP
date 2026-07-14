@@ -11,23 +11,18 @@ import (
 	"time"
 )
 
-func Model() string {
-	if m := os.Getenv("GEMINI_MODEL"); m != "" {
-		return m
-	}
-	return "gemini-flash-lite-latest"
-}
-
 type Part struct {
 	Text string `json:"text"`
 }
 
 type Content struct {
+	Role  string `json:"role"`
 	Parts []Part `json:"parts"`
 }
 
 type Request struct {
-	Contents []Content `json:"contents"`
+	Contents         []Content `json:"contents"`
+	SystemInstruction *Content `json:"system_instruction,omitempty"`
 }
 
 type Response struct {
@@ -36,7 +31,18 @@ type Response struct {
 	} `json:"candidates"`
 }
 
+func Model() string {
+	if m := os.Getenv("GEMINI_MODEL"); m != "" {
+		return m
+	}
+	return "gemini-flash-lite-latest"
+}
+
 func Chat(prompt string, timeout time.Duration) (string, error) {
+	return ChatWithHistory(prompt, nil, timeout)
+}
+
+func ChatWithHistory(prompt string, history []Content, timeout time.Duration) (string, error) {
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
 		return "", fmt.Errorf("GEMINI_API_KEY not set")
@@ -44,12 +50,14 @@ func Chat(prompt string, timeout time.Duration) (string, error) {
 
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", Model(), apiKey)
 
-	reqBody := Request{
-		Contents: []Content{
-			{Parts: []Part{{Text: prompt}}},
-		},
-	}
+	contents := make([]Content, 0, len(history)+1)
+	contents = append(contents, history...)
+	contents = append(contents, Content{
+		Role:  "user",
+		Parts: []Part{{Text: prompt}},
+	})
 
+	reqBody := Request{Contents: contents}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", fmt.Errorf("marshal: %w", err)

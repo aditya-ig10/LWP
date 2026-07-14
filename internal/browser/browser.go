@@ -19,20 +19,20 @@ type Page struct {
 }
 
 type Element struct {
-	Ref      int    `json:"ref"`
-	Tag      string `json:"tag"`
-	Type     string `json:"type"`
-	Text     string `json:"text,omitempty"`
-	Selector string `json:"selector"`
-	Href     string `json:"href,omitempty"`
-	Src      string `json:"src,omitempty"`
-	Alt      string `json:"alt,omitempty"`
-	Name     string `json:"name,omitempty"`
-	Value    string `json:"value,omitempty"`
+	Ref         int    `json:"ref"`
+	Tag         string `json:"tag"`
+	Type        string `json:"type"`
+	Text        string `json:"text,omitempty"`
+	Selector    string `json:"selector"`
+	Href        string `json:"href,omitempty"`
+	Src         string `json:"src,omitempty"`
+	Alt         string `json:"alt,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Value       string `json:"value,omitempty"`
 	Placeholder string `json:"placeholder,omitempty"`
-	Checked  bool   `json:"checked,omitempty"`
-	Disabled bool   `json:"disabled,omitempty"`
-	Rect     Rect   `json:"rect,omitempty"`
+	Checked     bool   `json:"checked,omitempty"`
+	Disabled    bool   `json:"disabled,omitempty"`
+	Rect        Rect   `json:"rect,omitempty"`
 }
 
 type Rect struct {
@@ -49,18 +49,37 @@ type Browser struct {
 	allocCancel context.CancelFunc
 }
 
+func userDataDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	dir := home + "/.config/lwp/chrome-profile"
+	os.MkdirAll(dir, 0700)
+	return dir
+}
+
 func New(headless bool) (*Browser, error) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", headless),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-extensions", true),
 		chromedp.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
+		chromedp.Flag("disable-background-networking", true),
+		chromedp.Flag("disable-extensions", true),
+		chromedp.Flag("disable-component-update", true),
+		chromedp.Flag("mute-audio", true),
+		chromedp.Flag("disable-default-apps", true),
 	)
 
 	if p := os.Getenv("LWP_CHROME_PATH"); p != "" {
 		opts = append(opts, chromedp.ExecPath(p))
+	}
+
+	if ud := userDataDir(); ud != "" {
+		opts = append(opts, chromedp.Flag("user-data-dir", ud))
+		opts = append(opts, chromedp.Flag("disable-session-crashed-bubble", true))
 	}
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -177,20 +196,6 @@ func (b *Browser) extractPage(ctx context.Context) (*Page, error) {
 	return page, nil
 }
 
-func (b *Browser) extractPageFull(ctx context.Context) (*Page, error) {
-	page, err := b.extractPage(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var screenshot []byte
-	if err := chromedp.Run(ctx, chromedp.FullScreenshot(&screenshot, 90)); err == nil {
-		page.Screenshot = screenshot
-	}
-
-	return page, nil
-}
-
 func (b *Browser) Refresh() (*Page, error) {
 	ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
 	defer cancel()
@@ -238,38 +243,6 @@ func (b *Browser) Submit(selector string) error {
 		chromedp.Submit(selector, chromedp.ByQuery),
 		chromedp.Sleep(3*time.Second),
 	)
-}
-
-func (b *Browser) ScreenshotElement(selector string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(b.ctx, 10*time.Second)
-	defer cancel()
-
-	var buf []byte
-	err := chromedp.Run(ctx,
-		chromedp.WaitVisible(selector, chromedp.ByQuery),
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			var rect []int
-			js := fmt.Sprintf(`(() => {
-				const el = document.querySelector(%q);
-				if (!el) return null;
-				const r = el.getBoundingClientRect();
-				return [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)];
-			})()`, selector)
-			if err := chromedp.Evaluate(js, &rect).Do(ctx); err != nil {
-				return err
-			}
-			if len(rect) != 4 || rect[2] == 0 || rect[3] == 0 {
-				return fmt.Errorf("element not visible or zero-size")
-			}
-			return chromedp.FullScreenshot(&buf, 90).Do(ctx)
-		}),
-	)
-	if err != nil {
-		return nil, err
-	}
-	// crop the full screenshot to just the element bounds
-	// for now we return full screenshot; caller can use Gemini Vision
-	return buf, nil
 }
 
 func (b *Browser) ScreenshotFull() ([]byte, error) {
