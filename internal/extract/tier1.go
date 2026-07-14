@@ -1,75 +1,398 @@
 package extract
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
 	"golang.org/x/net/html"
-
-	"github.com/aditya-ig10/LWP/internal/schema"
+	"golang.org/x/net/publicsuffix"
 )
 
-// In-memory page cache for Tier 1
-type cacheEntry struct {
-	page *schema.Page
-	expires time.Time
+// --- Persistent cookie jar ---
+
+type jar struct {
+	mu      sync.Mutex
+	entries map[string][]*http.Cookie
+}
+
+func newJar() *jar {
+	j := &jar{entries: map[string][]*http.Cookie{}}
+	j.load()
+	return j
+}
+
+func cookiePath() string {
+	home, _ := os.UserHomeDir()
+	return home + "/.config/lwp/cookies.json"
+}
+
+func (j *jar) load() {
+	data, err := os.ReadFile(cookiePath())
+	if err != nil {
+		return
+	}
+	json.Unmarshal(data, &j.entries)
+}
+
+func (j *jar) save() {
+	data, _ := json.MarshalIndent(j.entries, "", " ")
+	os.MkdirAll(cookiePath()[:len(cookiePath())-len("/cookies.json")], 0700)
+	os.WriteFile(cookiePath(), data, 0600)
+}
+
+func (j *jar) SetCookies(u *url.URL, cookies []*http.Cookie) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	key := u.Host
+	existing := j.entries[key]
+	merged := make([]*http.Cookie, 0, len(existing)+len(cookies))
+	seen := map[string]bool{}
+	for _, c := range existing {
+		k := c.Name + "=" + c.Domain + "=" + c.Path
+		seen[k] = true
+		merged = append(merged, c)
+	}
+	for _, c := range cookies {
+		k := c.Name + "=" + c.Domain + "=" + c.Path
+		if !seen[k] {
+			merged = append(merged, c)
+			seen[k] = true
+		} else {
+			for i, e := range merged {
+				if e.Name+"="+e.Domain+"="+e.Path == k {
+					merged[i] = c
+					break
+				}
+			}
+		}
+	}
+	j.entries[key] = merged
+	j.save()
+}
+
+func (j *jar) Cookies(u *url.URL) []*http.Cookie {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.entries[u.Host]
+}
+
+// --- Session info ---
+
+type SessionInfo struct {
+	Host   string `json:"host"`
+	Domain string `json:"domain"`
+	Name   string `json:"name"`
+}
+
+func Sessions() ([]SessionInfo, error) {
+	home, _ := os.UserHomeDir()
+	data, err := os.ReadFile(home + "/.config/lwp/cookies.json")
+	if err != nil {
+		return nil, nil
+	}
+	var entries map[string][]*http.Cookie
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, err
+	}
+	var out []SessionInfo
+	for host, cookies := range entries {
+		for _, c := range cookies {
+			if c.Name == "session" || c.Name == "token" || strings.Contains(c.Name, "auth") || strings.Contains(c.Name, "sid") || strings.Contains(c.Name, "login") {
+				out = append(out, SessionInfo{Host: host, Domain: c.Domain, Name: c.Name})
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+func ClearSessions() error {
+	home, _ := os.UserHomeDir()
+	return os.WriteFile(home+"/.config/lwp/cookies.json", []byte("{}"), 0600)
+}
+
+// --- HTTP client ---
+
+type Client struct {
+	http    *http.Client
+	jar     *jar
+	headers http.Header
 }
 
 var (
-	cacheMu    sync.Mutex
-	cache      = make(map[string]*cacheEntry)
-	cacheTTL   = 30 * time.Second
-	cacheMax   = 64
-
-	// Shared HTTP transport with connection reuse
-	sharedTransport = &http.Transport{
-		MaxIdleConns:        8,
-		MaxIdleConnsPerHost: 4,
-		IdleConnTimeout:     30 * time.Second,
-		DisableCompression:  false,
-	}
+	sharedJar    = newJar()
+	sharedClient *Client
+	clientMu     sync.Mutex
 )
 
-func cacheGet(url string) *schema.Page {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	e, ok := cache[url]
-	if !ok || time.Now().After(e.expires) {
-		if ok {
-			delete(cache, url)
-		}
-		return nil
+func DefaultClient() *Client {
+	clientMu.Lock()
+	defer clientMu.Unlock()
+	if sharedClient == nil {
+		sharedClient = newClient()
 	}
-	return e.page
+	return sharedClient
 }
 
-func cacheSet(url string, page *schema.Page) {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	if len(cache) >= cacheMax {
-		// Evict oldest
-		var oldest string
-		var oldestTime time.Time
-		for k, v := range cache {
-			if oldest == "" || v.expires.Before(oldestTime) {
-				oldest = k
-				oldestTime = v.expires
+func newClient() *Client {
+	httpJar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	c := &Client{
+		headers: http.Header{
+			"User-Agent":      {"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"},
+			"Accept":          {"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+			"Accept-Language": {"en-US,en;q=0.5"},
+		},
+		jar: sharedJar,
+	}
+	c.http = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        8,
+			MaxIdleConnsPerHost: 4,
+			IdleConnTimeout:     30 * time.Second,
+			DisableCompression:  false,
+		},
+		Jar: httpJar,
+	}
+	// Restore persistent cookies into the HTTP jar
+	for host, cookies := range sharedJar.entries {
+		if u, err := url.Parse("https://" + host); err == nil {
+			httpJar.SetCookies(u, cookies)
+		}
+	}
+	return c
+}
+
+func (c *Client) saveCookies() {
+	for _, host := range c.jarHosts() {
+		if u, err := url.Parse("https://" + host); err == nil {
+			cookies := c.http.Jar.Cookies(u)
+			if len(cookies) > 0 {
+				c.jar.SetCookies(u, cookies)
 			}
 		}
-		delete(cache, oldest)
 	}
-	cache[url] = &cacheEntry{page: page, expires: time.Now().Add(cacheTTL)}
 }
+
+func (c *Client) jarHosts() []string {
+	c.jar.mu.Lock()
+	defer c.jar.mu.Unlock()
+	hosts := make([]string, 0, len(c.jar.entries))
+	for h := range c.jar.entries {
+		hosts = append(hosts, h)
+	}
+	return hosts
+}
+
+// --- Page ---
+
+type Page struct {
+	URL      string    `json:"url"`
+	Title    string    `json:"title"`
+	Content  string    `json:"content"`
+	Sections []Section `json:"sections,omitempty"`
+	Links    []Link    `json:"links,omitempty"`
+	Forms    []Form    `json:"forms,omitempty"`
+	Status   int       `json:"status"`
+	Error    string    `json:"error,omitempty"`
+	Metadata Metadata  `json:"metadata"`
+}
+
+type Section struct {
+	Heading string `json:"heading"`
+	Text    string `json:"text"`
+	Level   int    `json:"level"`
+}
+
+type Link struct {
+	Text string `json:"text"`
+	Href string `json:"href"`
+}
+
+type Form struct {
+	Ref      int       `json:"ref"`
+	Action   string    `json:"action"`
+	Method   string    `json:"method"`
+	Fields   []Field   `json:"fields"`
+	Submit   string    `json:"submit,omitempty"`
+}
+
+type Field struct {
+	Ref         int    `json:"ref"`
+	Type        string `json:"type"`
+	Name        string `json:"name"`
+	Label       string `json:"label,omitempty"`
+	Placeholder string `json:"placeholder,omitempty"`
+	Required    bool   `json:"required"`
+	Value       string `json:"value,omitempty"`
+	Options     []string `json:"options,omitempty"`
+}
+
+type Metadata struct {
+	LatencyMs     int64  `json:"latency_ms"`
+	ContentLength int    `json:"content_length"`
+	FetchedAt     string `json:"fetched_at"`
+	HasAuthForm   bool   `json:"has_auth_form"`
+}
+
+// --- Core protocol: Fetch ---
+
+func Fetch(rawURL string, timeout time.Duration) (*Page, error) {
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		rawURL = "https://" + rawURL
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+
+	start := time.Now()
+	c := DefaultClient()
+	req := &http.Request{
+		Method: "GET",
+		URL:    parsed,
+		Header: c.headers.Clone(),
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	c.saveCookies()
+
+	latency := time.Since(start).Milliseconds()
+	limited := io.LimitReader(resp.Body, 5<<20)
+
+	doc, err := html.Parse(limited)
+	if err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+
+	page := &Page{
+		URL:    resp.Request.URL.String(),
+		Status: resp.StatusCode,
+	}
+
+	extractPage(doc, page)
+	page.Metadata.LatencyMs = latency
+	page.Metadata.FetchedAt = time.Now().UTC().Format(time.RFC3339)
+	page.Metadata.ContentLength = len(page.Content)
+
+	return page, nil
+}
+
+// --- Core protocol: Search ---
+
+func Search(query string, site string, timeout time.Duration) (*Page, error) {
+	searchURLs := map[string]string{
+		"google":    "https://www.google.com/search?q=%s",
+		"bing":      "https://www.bing.com/search?q=%s",
+		"duckduckgo":"https://duckduckgo.com/?q=%s",
+		"flipkart":  "https://www.flipkart.com/search?q=%s",
+		"amazon":    "https://www.amazon.com/s?k=%s",
+		"amazon.in": "https://www.amazon.in/s?k=%s",
+		"myntra":    "https://www.myntra.com/%s",
+		"ajio":      "https://www.ajio.com/search/?text=%s",
+		"ebay":      "https://www.ebay.com/sch/i.html?_nkw=%s",
+		"walmart":   "https://www.walmart.com/search?q=%s",
+		"target":    "https://www.target.com/s?searchTerm=%s",
+		"bestbuy":   "https://www.bestbuy.com/site/searchpage.jsp?st=%s",
+		"reddit":    "https://www.reddit.com/search/?q=%s",
+		"youtube":   "https://www.youtube.com/results?search_query=%s",
+		"github":    "https://github.com/search?q=%s",
+		"twitter":   "https://twitter.com/search?q=%s",
+		"linkedin":  "https://www.linkedin.com/search/results/all/?keywords=%s",
+	}
+
+	u := ""
+	if site != "" {
+		key := strings.ToLower(strings.TrimSpace(site))
+		key = strings.TrimPrefix(key, "www.")
+		key = strings.TrimSuffix(key, ".com")
+		key = strings.TrimSuffix(key, ".in")
+		if tmpl, ok := searchURLs[key]; ok {
+			u = fmt.Sprintf(tmpl, url.QueryEscape(query))
+		}
+	}
+	if u == "" {
+		u = fmt.Sprintf("https://www.google.com/search?q=%s", url.QueryEscape(query))
+	}
+	return Fetch(u, timeout)
+}
+
+// --- Core protocol: Submit ---
+
+func Submit(rawURL string, fields map[string]string, timeout time.Duration) (*Page, error) {
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		rawURL = "https://" + rawURL
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+
+	start := time.Now()
+	c := DefaultClient()
+
+	form := url.Values{}
+	for k, v := range fields {
+		form.Set(k, v)
+	}
+
+	req := &http.Request{
+		Method: "POST",
+		URL:    parsed,
+		Header: c.headers.Clone(),
+		Body:   io.NopCloser(strings.NewReader(form.Encode())),
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("submit: %w", err)
+	}
+	defer resp.Body.Close()
+
+	c.saveCookies()
+
+	latency := time.Since(start).Milliseconds()
+	limited := io.LimitReader(resp.Body, 5<<20)
+
+	doc, err := html.Parse(limited)
+	if err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+
+	page := &Page{
+		URL:    resp.Request.URL.String(),
+		Status: resp.StatusCode,
+	}
+	extractPage(doc, page)
+	page.Metadata.LatencyMs = latency
+	page.Metadata.FetchedAt = time.Now().UTC().Format(time.RFC3339)
+	page.Metadata.ContentLength = len(page.Content)
+
+	return page, nil
+}
+
+// --- HTML extraction ---
 
 var boilerplateIDs = []string{
 	"nav", "navbar", "navigation", "menu", "sidebar", "footer", "header",
 	"cookie", "cookies", "consent", "banner", "popup", "modal", "overlay",
 	"advertisement", "ads", "ad", "social", "share", "comments", "comment",
-	"related", "recommendations", "sidebar-right", "sidebar-left",
+	"related", "recommendations",
 }
 
 var boilerplateClasses = []string{
@@ -99,197 +422,89 @@ func isBoilerplate(n *html.Node) bool {
 	return false
 }
 
-func isContentContainer(n *html.Node) bool {
-	switch n.Data {
-	case "main", "article", "section", "blockquote":
-		return true
+func isLoginRelated(n *html.Node) bool {
+	for _, a := range n.Attr {
+		lower := strings.ToLower(a.Val)
+		if a.Key == "id" || a.Key == "class" || a.Key == "name" {
+			if strings.Contains(lower, "login") || strings.Contains(lower, "signin") ||
+				strings.Contains(lower, "log-in") || strings.Contains(lower, "sign-in") ||
+				strings.Contains(lower, "auth") || strings.Contains(lower, "password") {
+				return true
+			}
+		}
 	}
 	return false
 }
 
-func Tier1(url string, timeout time.Duration) (*schema.Page, error) {
-	if p := cacheGet(url); p != nil {
-		return p, nil
-	}
-	start := time.Now()
+func extractPage(n *html.Node, page *Page) {
+	page.Title = extractTitle(n)
 
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-
-	client := &http.Client{Timeout: timeout, Transport: sharedTransport}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	limited := io.LimitReader(resp.Body, 10<<20)
-
-	doc, err := html.Parse(limited)
-	if err != nil {
-		return nil, err
-	}
-
-	latency := time.Since(start).Milliseconds()
-
-	page := &schema.Page{
-		URL: resp.Request.URL.String(),
-		Metadata: schema.Metadata{
-			Tier:      1,
-			LatencyMs: latency,
-			FetchedAt: time.Now().UTC().Format(time.RFC3339),
-		},
-	}
-
-	extractPage(doc, page)
-
-	cacheSet(url, page)
-	return page, nil
-}
-
-func extractPage(n *html.Node, page *schema.Page) {
-	title := extractTitle(n)
-	if title != "" {
-		page.Title = title
-	}
-
-	var sections []schema.Section
-	var elements []schema.Element
-	refCounter := 0
-
-	// Collect content blocks with scores
 	type block struct {
 		text  string
 		score int
 		isSec bool
 		level int
 	}
+
 	var blocks []block
+	var links []Link
+	var forms []Form
+	formRef := 0
+	hasAuthForm := false
 
 	var walk func(*html.Node, int)
 	walk = func(n *html.Node, depth int) {
 		if n.Type == html.ElementNode {
 			tag := n.Data
-
-			// Skip non-content tags entirely
 			switch tag {
 			case "script", "style", "noscript", "svg", "meta", "link", "iframe":
 				return
 			}
-
-			// Skip boilerplate sections
 			if tag == "nav" || tag == "footer" || isBoilerplate(n) {
 				return
 			}
-
 			switch tag {
 			case "h1", "h2", "h3", "h4", "h5", "h6":
 				text := collectText(n)
 				if text != "" {
-					lvl := headingLevel(tag)
-					blocks = append(blocks, block{
-						text:  text,
-						score: 10,
-						isSec: true,
-						level: lvl,
-					})
+					blocks = append(blocks, block{text: text, score: 10, isSec: true, level: headingLevel(tag)})
 				}
 			case "p":
 				text := collectText(n)
 				if text != "" {
-					// Paragraphs get base score + bonus for length
 					s := len(text)
 					score := 3
-					if s > 80 {
-						score = 5
-					}
-					if s > 200 {
-						score = 6
-					}
-					if isContentContainer(n.Parent) {
-						score += 2
-					}
+					if s > 80 { score = 5 }
+					if s > 200 { score = 6 }
+					if isContentContainer(n.Parent) { score += 2 }
 					blocks = append(blocks, block{text: text, score: score})
 				}
+			case "a":
+				href := attr(n, "href")
+				if href != "" && !strings.HasPrefix(href, "#") && !strings.HasPrefix(href, "javascript:") {
+					links = append(links, Link{Text: collectText(n), Href: href})
+				}
+			case "form":
+				formRef++
+				f := parseForm(n, formRef)
+				if f != nil {
+					forms = append(forms, *f)
+					if isLoginForm(f) {
+						hasAuthForm = true
+					}
+				}
 			case "div", "section", "article", "blockquote":
-				// Only extract if contains meaningful text directly (not just children)
 				direct := collectText(n)
 				linkCount := countLinks(n)
 				wordCount := len(strings.Fields(direct))
 				if wordCount > 15 {
 					score := 4
-					if isContentContainer(n) {
-						score = 6
+					if isContentContainer(n) { score = 6 }
+					if linkCount > 0 && wordCount/linkCount < 5 { score = 1 }
+					if score > 1 {
+						blocks = append(blocks, block{text: direct, score: score})
 					}
-					if linkCount > 0 && wordCount/linkCount < 5 {
-						score = 1 // mostly links, likely boilerplate
-					}
-					blocks = append(blocks, block{text: direct, score: score})
 				}
-			case "a":
-				href := attr(n, "href")
-				if href != "" && !strings.HasPrefix(href, "#") && !strings.HasPrefix(href, "javascript:") {
-					refCounter++
-					elements = append(elements, schema.Element{
-						Ref:  refCounter,
-						Type: "link",
-						Text: collectText(n),
-						Href: href,
-					})
-				}
-			case "input":
-				inputType := attr(n, "type")
-				if inputType == "hidden" {
-					return
-				}
-				refCounter++
-				elem := schema.Element{
-					Ref:  refCounter,
-					Type: "input",
-					Name: attr(n, "name"),
-				}
-				if label := findLabel(n); label != "" {
-					elem.Text = label
-				} else {
-					elem.Text = attr(n, "placeholder")
-				}
-				elements = append(elements, elem)
-			case "button":
-				refCounter++
-				elements = append(elements, schema.Element{
-					Ref:  refCounter,
-					Type: "button",
-					Text: collectText(n),
-				})
-			case "select":
-				refCounter++
-				elem := schema.Element{
-					Ref:  refCounter,
-					Type: "select",
-					Name: attr(n, "name"),
-				}
-				if label := findLabel(n); label != "" {
-					elem.Text = label
-				}
-				elements = append(elements, elem)
-			case "textarea":
-				refCounter++
-				elem := schema.Element{
-					Ref:  refCounter,
-					Type: "textarea",
-					Name: attr(n, "name"),
-				}
-				if label := findLabel(n); label != "" {
-					elem.Text = label
-				}
-				elements = append(elements, elem)
-			default:
-				// li, td, th, etc - skip at this level, content captured via parent
 			}
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
@@ -298,74 +513,152 @@ func extractPage(n *html.Node, page *schema.Page) {
 	}
 	walk(n, 0)
 
-	// Sort blocks by score (collect high scoring first)
-	// For efficiency: just collect all, sort, and take top
-	// Simple approach: take all blocks, deduplicate, and maintain order but filter low-score
-	var high, medium, low []block
-	for _, b := range blocks {
-		if b.isSec {
-			high = append(high, b)
-			continue
-		}
-		switch {
-		case b.score >= 5:
-			high = append(high, b)
-		case b.score >= 3:
-			medium = append(medium, b)
-		default:
-			low = append(low, b)
-		}
-	}
-
-	// Build content: headings + high > medium (only include medium if space)
-	var ordered []block
+	// Score-sort blocks, preserve order within tiers
+	var high, medium []block
 	seen := map[string]bool{}
-
-	addBlock := func(b block) {
+	for _, b := range blocks {
 		key := collapseWS(strings.ToLower(b.text))
 		if len(key) < 10 || seen[key] {
-			return
+			continue
 		}
 		seen[key] = true
-		ordered = append(ordered, b)
+		if b.isSec || b.score >= 5 {
+			high = append(high, b)
+		} else if b.score >= 3 {
+			medium = append(medium, b)
+		}
 	}
 
-	// Preserve original order from the walk
+	total := 0
 	for _, b := range high {
-		addBlock(b)
+		total += len(b.text)
 	}
-	// Only include medium-scoring blocks if content is sparse (under 1KB)
-	totalContent := 0
-	for _, b := range ordered {
-		totalContent += len(b.text)
-	}
-	if totalContent < 1024 {
-		for _, b := range medium {
-			addBlock(b)
-		}
+	if total < 1024 {
+		high = append(high, medium...)
 	}
 
-	// Build output
 	var textParts []string
-	for _, b := range ordered {
+	for _, b := range high {
 		textParts = append(textParts, b.text)
-		if b.isSec {
-			sections = append(sections, schema.Section{
-				Heading: b.text,
-				Level:   b.level,
-			})
-		}
 	}
 
 	page.Content = compactText(textParts)
-	page.Sections = sections
-	page.Elements = elements
-	page.Metadata.ContentLength = len(page.Content)
+	page.Links = links
+	page.Forms = forms
+	page.Metadata.HasAuthForm = hasAuthForm
 
-	// Hard cap at ~100k chars to limit token usage
 	if len(page.Content) > 100000 {
 		page.Content = page.Content[:100000]
 	}
+}
+
+func parseForm(n *html.Node, ref int) *Form {
+	f := &Form{
+		Ref:    ref,
+		Action: attr(n, "action"),
+		Method: strings.ToUpper(attr(n, "method")),
+	}
+	if f.Method == "" { f.Method = "GET" }
+	if f.Action == "" { f.Action = "#" }
+
+	fieldRef := 0
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "input":
+				t := attr(n, "type")
+				if t == "hidden" || t == "submit" || t == "image" {
+					if t == "submit" || t == "image" {
+						f.Submit = attr(n, "value")
+					}
+					return
+				}
+				fieldRef++
+				field := Field{
+					Ref:   fieldRef,
+					Type:  t,
+					Name:  attr(n, "name"),
+					Placeholder: attr(n, "placeholder"),
+					Value: attr(n, "value"),
+					Required: attr(n, "required") == "required" || attr(n, "required") == "",
+				}
+				if label := findLabel(n); label != "" {
+					field.Label = label
+				}
+				f.Fields = append(f.Fields, field)
+			case "select":
+				fieldRef++
+				field := Field{
+					Ref:   fieldRef,
+					Type:  "select",
+					Name:  attr(n, "name"),
+					Required: attr(n, "required") == "required",
+				}
+				if label := findLabel(n); label != "" {
+					field.Label = label
+				}
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					if c.Type == html.ElementNode && c.Data == "option" {
+						field.Options = append(field.Options, attr(c, "value"))
+					}
+				}
+				f.Fields = append(f.Fields, field)
+			case "textarea":
+				fieldRef++
+				field := Field{
+					Ref:   fieldRef,
+					Type:  "textarea",
+					Name:  attr(n, "name"),
+					Placeholder: attr(n, "placeholder"),
+					Required: attr(n, "required") == "required",
+				}
+				if label := findLabel(n); label != "" {
+					field.Label = label
+				}
+				f.Fields = append(f.Fields, field)
+			case "button":
+				bt := attr(n, "type")
+				if bt == "submit" || bt == "" {
+					f.Submit = collectText(n)
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	if len(f.Fields) == 0 {
+		return nil
+	}
+	return f
+}
+
+func isLoginForm(f *Form) bool {
+	hasPassword := false
+	hasSubmit := f.Submit != ""
+	for _, field := range f.Fields {
+		if field.Type == "password" {
+			hasPassword = true
+		}
+		if strings.Contains(strings.ToLower(field.Name), "login") ||
+			strings.Contains(strings.ToLower(field.Name), "user") ||
+			strings.Contains(strings.ToLower(field.Name), "email") {
+			hasSubmit = true
+		}
+	}
+	return hasPassword && hasSubmit
+}
+
+// --- Helpers ---
+
+func isContentContainer(n *html.Node) bool {
+	switch n.Data {
+	case "main", "article", "section", "blockquote":
+		return true
+	}
+	return false
 }
 
 func countLinks(n *html.Node) int {
@@ -408,9 +701,7 @@ func collectText(n *html.Node) string {
 		if n.Type == html.TextNode {
 			s := strings.TrimSpace(n.Data)
 			if s != "" {
-				if b.Len() > 0 {
-					b.WriteByte(' ')
-				}
+				if b.Len() > 0 { b.WriteByte(' ') }
 				b.WriteString(s)
 			}
 		}
@@ -446,23 +737,30 @@ func findLabel(n *html.Node) string {
 		}
 		p = p.Parent
 	}
-	return ""
+	// Also look for label with 'for' attribute matching id
+	var search func(*html.Node) string
+	search = func(n *html.Node) string {
+		if n.Type == html.ElementNode && n.Data == "label" && attr(n, "for") == id {
+			return collectText(n)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			if t := search(c); t != "" {
+				return t
+			}
+		}
+		return ""
+	}
+	return search(n)
 }
 
 func headingLevel(tag string) int {
 	switch tag {
-	case "h1":
-		return 1
-	case "h2":
-		return 2
-	case "h3":
-		return 3
-	case "h4":
-		return 4
-	case "h5":
-		return 5
-	case "h6":
-		return 6
+	case "h1": return 1
+	case "h2": return 2
+	case "h3": return 3
+	case "h4": return 4
+	case "h5": return 5
+	case "h6": return 6
 	}
 	return 0
 }
@@ -470,9 +768,7 @@ func headingLevel(tag string) int {
 func compactText(parts []string) string {
 	var b strings.Builder
 	for i, p := range parts {
-		if i > 0 {
-			b.WriteString("\n\n")
-		}
+		if i > 0 { b.WriteString("\n\n") }
 		b.WriteString(strings.TrimSpace(p))
 	}
 	return collapseWS(b.String())
@@ -483,10 +779,7 @@ func collapseWS(s string) string {
 	space := false
 	for _, r := range s {
 		if unicode.IsSpace(r) {
-			if !space {
-				b.WriteByte(' ')
-				space = true
-			}
+			if !space { b.WriteByte(' '); space = true }
 		} else {
 			b.WriteRune(r)
 			space = false
