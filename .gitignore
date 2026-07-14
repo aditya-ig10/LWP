@@ -1,1 +1,5 @@
 notes/
+/lwp
+*.test
+*.out
+cover.out
